@@ -112,7 +112,7 @@ uv run pytest
 
 GitHub Actions workflows live in `.github/workflows/`:
 
-- `ci.yml` runs Python tests on Python 3.11 and 3.12 with `uv`, compiles Python modules, smoke-imports the FastMCP server, and builds the legacy TypeScript reference with `npm run build`.
+- `ci.yml` runs Python tests on Python 3.11 and 3.12 with `uv`, compiles Python modules, smoke-imports the FastMCP server with `PYTHONPATH=src`, and builds the legacy TypeScript reference with `npm run build`.
 - `release.yml` runs tests on tag/manual dispatch and uploads a source-tree artifact for release review.
 
 Both workflows set `CAPTURE_ONE_MCP_ALLOW_WRITE=0` and do not require Capture One, macOS Automation permissions, real catalogs, or RAW files.

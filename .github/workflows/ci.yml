@@ -23,6 +23,7 @@ jobs:
       CAPTURE_ONE_MCP_ALLOW_WRITE: "0"
       C1_MCP_PREVIEW_DIR: /tmp/c1-mcp/previews
       C1_MCP_LOG_DIR: /tmp/c1-mcp/logs
+      PYTHONPATH: src
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -47,7 +48,7 @@ jobs:
         run: uv run python -m compileall -q src tests
 
       - name: Smoke import FastMCP server
-        run: uv run python -c "from c1_mcp.server import mcp; print(mcp.name)"
+        run: uv run python -c "from c1_mcp.server import mcp; print(type(mcp).__name__)"
 
   legacy-typescript-build:
     name: Legacy TypeScript build
