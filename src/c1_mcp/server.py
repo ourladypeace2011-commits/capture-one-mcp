@@ -16,10 +16,15 @@ _RESOURCE_MAP = {
     "c1://docs/tool-contracts": "tool_contracts.md",
 }
 _RESOURCE_DIR = Path(__file__).parent / "resources"
-for uri, filename in _RESOURCE_MAP.items():
-    def reader(filename=filename):
+def _make_resource_reader(filename: str):
+    def read_resource() -> str:
         return (_RESOURCE_DIR / filename).read_text(encoding="utf-8")
-    mcp.resource(uri)(reader)
+
+    return read_resource
+
+
+for uri, filename in _RESOURCE_MAP.items():
+    mcp.resource(uri)(_make_resource_reader(filename))
 
 @mcp.prompt(name="diagnose_ecommerce_image")
 def diagnose_ecommerce_image() -> str:
