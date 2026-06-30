@@ -1,0 +1,24 @@
+[project]
+name = "capture-one-mcp"
+version = "0.2.0"
+description = "Safe FastMCP bridge for Capture One automation and image review"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastmcp",
+  "pydantic",
+  "pillow",
+  "numpy",
+  "opencv-python",
+  "scikit-image",
+  "rich",
+  "python-dotenv",
+  "pytest",
+]
+
+[project.scripts]
+capture-one-mcp = "c1_mcp.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

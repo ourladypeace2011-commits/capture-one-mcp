@@ -1,90 +1,125 @@
 # Capture One MCP
 
-AppleScript-backed MCP server for Capture One on macOS.
+This repository is being migrated from a TypeScript proof of concept to a clean **FastMCP + Python** implementation for local Capture One automation on macOS.
 
-This server uses Capture One's installed scripting dictionary (`CaptureOne.sdef`), not screen scraping. By default the server expects Capture One at `/Applications/Capture One.app`; override with `CAPTURE_ONE_APP` if needed.
+The existing TypeScript implementation in `src/index.ts` remains available as legacy/reference during the migration. It must not be deleted until the Python implementation reaches parity.
 
-## Scope
+## Architecture
 
-Capture One MCP is a dedicated MCP control surface for Capture One. It focuses on automation primitives: reading the active Capture One context, reading/writing supported adjustment fields, locating preview cache files, and enabling vision-assisted analysis workflows.
+The Python server exposes safe, typed MCP capabilities. It does **not** expose arbitrary AppleScript execution.
 
-It does **not** try to replace a photographer/retoucher, guarantee exact style matching, or ship a one-click grading bot. See [`docs/automation-scope.md`](docs/automation-scope.md) for the project boundary.
+- FastMCP server: `src/c1_mcp/server.py`
+- Tool definitions: `src/c1_mcp/tools/`
+- Capture One, AppleScript, preview cache, image analysis, and reporting services: `src/c1_mcp/services/`
+- Safety gates and operation logs: `src/c1_mcp/safety/`
+- Fixed AppleScript snippets: `src/c1_mcp/applescript/`
 
-## Tools
+## Safety model
 
-Read-only by default:
+Arbitrary AppleScript execution is intentionally not exposed. MCP clients receive bounded capabilities such as `captureone.get_app_state`, `captureone.find_selected_preview_cache`, and `image.analyze_luminance`, not a generic script runner.
 
-- `capture_one_status` — install/running status, app version, current document, selected count
-- `capture_one_selected_variants` — selected variants as TSV
-- `capture_one_list_recipes` — process recipes as TSV
-- `capture_one_adjustment_fields` — list supported adjustment fields
-- `capture_one_get_selected_adjustments` — read tone/color adjustment values from selected variants
-- `capture_one_find_selected_preview_cache` — locate internal Capture One preview/thumbnail cache files for selected variants
-- `capture_one_convert_selected_preview_cache` — convert internal preview cache to temporary JPEGs for vision analysis, without Capture One export
+Mutating tools are gated:
 
-Write/export tools are locked unless started with `CAPTURE_ONE_MCP_ALLOW_WRITE=1`:
+- `CAPTURE_ONE_MCP_ALLOW_WRITE=1` is required for real writes.
+- Mutating tools default to `dry_run=true`.
+- Original variants should not be modified by default.
+- Clone variants are preferred.
+- Adjustment deltas are bounded by Pydantic validation.
 
-- `capture_one_set_selected_adjustments` — generic selected-variant adjustment writer
-- `capture_one_set_selected_rating`
-- `capture_one_process_selected`
-- `capture_one_capture`
-
-## Adjustment coverage
-
-The server currently exposes 83 directly writable adjustment fields from Capture One's AppleScript dictionary, including white balance, exposure, contrast, saturation, color balance, levels, highlight/shadow recovery, clarity, dehaze amount, vignette, sharpening, noise reduction, film grain, and moire.
-
-Nested/special objects need dedicated helpers next: curves, color editor settings, and RGB color coercion. Those are controllable in principle, but should not be treated as a loose string API.
-
-## Preview cache notes
-
-Capture One can maintain per-image internal cache folders such as:
-
-```text
-<image folder>/CaptureOne/Cache/Proxies/<raw filename>.cop
-<image folder>/CaptureOne/Cache/Proxies/<raw filename>.cof
-<image folder>/CaptureOne/Cache/Thumbnails/<raw filename>.[uuid].cot
-```
-
-On the checked local sample, `.cop` is a JPEG XL container readable by macOS `sips`, `.cot` is JPEG, and `.cof` is a grayscale JPEG focus/preview sidecar. `capture_one_convert_selected_preview_cache` uses `sips` to create temporary JPEGs for vision models; it does not ask Capture One to export/process the image.
-
-Session/catalog/folder-browser storage can differ, so cache lookup checks the selected image folder plus current-document path/folder candidates. Real catalog packages still need a live catalog sample to harden lookup rules.
-
-## Install / build
+## Install with uv
 
 ```bash
-npm install
-npm run build
+uv sync
 ```
 
-## Run
+If dependencies need to be refreshed:
 
 ```bash
-node dist/index.js
+uv add fastmcp pydantic pillow numpy opencv-python scikit-image rich python-dotenv pytest
+uv lock
 ```
 
-Enable mutating tools only when you want the model to change Capture One state:
+## Run the FastMCP server
 
 ```bash
-CAPTURE_ONE_MCP_ALLOW_WRITE=1 node dist/index.js
+uv run fastmcp run src/c1_mcp/server.py:mcp
 ```
 
-## MCP client config example
+The default transport is stdio.
+
+## MCP client config
 
 ```json
 {
   "mcpServers": {
     "capture-one": {
-      "command": "node",
-      "args": ["/absolute/path/to/capture-one-mcp/dist/index.js"],
+      "command": "uv",
+      "args": [
+        "run",
+        "fastmcp",
+        "run",
+        "src/c1_mcp/server.py:mcp"
+      ],
       "env": {
-        "CAPTURE_ONE_MCP_ALLOW_WRITE": "0"
+        "CAPTURE_ONE_MCP_ALLOW_WRITE": "0",
+        "C1_MCP_PREVIEW_DIR": "/tmp/c1-mcp/previews",
+        "C1_MCP_LOG_DIR": "/tmp/c1-mcp/logs"
       }
     }
   }
 }
 ```
 
-For export/capture/rating changes, set `CAPTURE_ONE_MCP_ALLOW_WRITE` to `1`.
+## Read-only tools
+
+- `captureone.get_app_state`
+- `captureone.get_selected_variants`
+- `captureone.list_recipes`
+- `captureone.list_adjustment_fields`
+- `captureone.get_selected_adjustments`
+- `captureone.find_selected_preview_cache`
+- `captureone.convert_selected_preview_cache`
+- `image.detect_background`
+- `image.analyze_luminance`
+- `image.detect_color_cast`
+- `image.compare_to_reference`
+- `report.generate_batch_review`
+
+## Write-gated tools
+
+These tools default to dry run and require `CAPTURE_ONE_MCP_ALLOW_WRITE=1` for real writes:
+
+- `captureone.create_clone_variant`
+- `captureone.apply_adjustments`
+- `captureone.export_before_after`
+- `captureone.rollback_last_change`
+
+Current write behavior is deliberately conservative; Capture One-specific real writes are isolated behind services and return structured not-implemented errors where they cannot be safely tested in this environment.
+
+## Preview cache notes
+
+The preview cache service preserves the TypeScript proof-of-concept lookup strategy. It checks likely Capture One cache roots near the selected image folder, sibling `CaptureOne/Cache` folders, document path candidates, and document folder candidates. It supports `.cop`, `.cot`, and `.cof` cache files and conversion through macOS `sips`.
+
+## Tests
+
+Tests do not require Capture One, macOS Automation permissions, real catalogs, real RAW files, or network access.
+
+```bash
+uv run pytest
+```
+
+## CI/CD
+
+GitHub Actions workflows live in `.github/workflows/`:
+
+- `ci.yml` runs Python tests on Python 3.11 and 3.12 with `uv`, compiles Python modules, smoke-imports the FastMCP server with `PYTHONPATH=src`, and builds the legacy TypeScript reference with `npm run build`.
+- `release.yml` runs tests on tag/manual dispatch and uploads a source-tree artifact for release review.
+
+Both workflows set `CAPTURE_ONE_MCP_ALLOW_WRITE=0` and do not require Capture One, macOS Automation permissions, real catalogs, or RAW files.
+
+## Legacy TypeScript reference
+
+The TypeScript proof of concept uses `@modelcontextprotocol/sdk` directly and remains useful for migration source material, especially AppleScript snippets, adjustment field names, write gating, and preview-cache behavior.
 
 ## License
 

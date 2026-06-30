@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - fastmcp-python-port
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      CAPTURE_ONE_MCP_ALLOW_WRITE: "0"
+      C1_MCP_PREVIEW_DIR: /tmp/c1-mcp/previews
+      C1_MCP_LOG_DIR: /tmp/c1-mcp/logs
+      PYTHONPATH: src
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Compile Python modules
+        run: uv run python -m compileall -q src tests
+
+      - name: Smoke import FastMCP server
+        run: uv run python -c "from c1_mcp.server import mcp; print(type(mcp).__name__)"
+
+  legacy-typescript-build:
+    name: Legacy TypeScript build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build legacy TypeScript reference
+        run: npm run build
