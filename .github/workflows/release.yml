@@ -1,0 +1,48 @@
+name: Release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-package-artifact:
+    name: Build Python package artifact
+    runs-on: ubuntu-latest
+    env:
+      CAPTURE_ONE_MCP_ALLOW_WRITE: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests before packaging
+        run: uv run pytest -q
+
+      - name: Build source tree artifact
+        run: |
+          mkdir -p artifact
+          tar --exclude='.git' --exclude='node_modules' --exclude='dist' -czf artifact/capture-one-mcp-python-src.tar.gz .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-one-mcp-python-src
+          path: artifact/capture-one-mcp-python-src.tar.gz
+          if-no-files-found: error
