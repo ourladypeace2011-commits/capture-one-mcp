@@ -290,6 +290,14 @@ function findFirstExisting(paths: string[]): string | null {
   return null;
 }
 
+function firstNonNull<T, R>(items: T[], fn: (item: T) => R | null): R | null {
+  for (const item of items) {
+    const result = fn(item);
+    if (result) return result;
+  }
+  return null;
+}
+
 function listThumbnailCandidates(cacheRoot: string, imageBaseName: string): string[] {
   const thumbDir = path.join(cacheRoot, "Thumbnails");
   try {
@@ -299,6 +307,37 @@ function listThumbnailCandidates(cacheRoot: string, imageBaseName: string): stri
   } catch {
     return [];
   }
+}
+
+// Catalog (.cocatalog) caches store proxy/focus previews under
+// Cache/Previews/<YYYY/MM/DD/HH>/<raw filename>.cop|.cof — date-nested, not the
+// flat session-style Cache/Proxies/. Walk the Previews tree (depth-capped) for
+// <imageBaseName>.<ext>. Catalog thumbnails are named by numeric catalog id, not
+// the raw basename, so catalog thumbnail lookup still needs the catalog DB and is
+// intentionally left to the session-style Thumbnails path above.
+function walkForFile(dir: string, targetName: string, maxDepth: number): string | null {
+  if (maxDepth < 0) return null;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name === targetName) return path.join(dir, entry.name);
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const found = walkForFile(path.join(dir, entry.name), targetName, maxDepth - 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function findCatalogPreviewFile(cacheRoot: string, imageBaseName: string, ext: string): string | null {
+  // Previews date tree is Previews/YYYY/MM/DD/HH → 4 levels; cap at 6 for headroom.
+  return walkForFile(path.join(cacheRoot, "Previews"), `${imageBaseName}.${ext}`, 6);
 }
 
 function uniqueStrings(values: Array<string | null | undefined>): string[] {
@@ -389,8 +428,10 @@ function findCacheForVariant(context: CacheLookupContext, variant: SelectedVaria
   const proxyCandidates = roots.map((root) => path.join(root, "Proxies", `${imageBaseName}.cop`));
   const focusCandidates = roots.map((root) => path.join(root, "Proxies", `${imageBaseName}.cof`));
   const thumbnails = roots.flatMap((root) => listThumbnailCandidates(root, imageBaseName));
-  const proxy = findFirstExisting(proxyCandidates);
-  const focus = findFirstExisting(focusCandidates);
+  const proxy = findFirstExisting(proxyCandidates)
+    ?? firstNonNull(roots, (root) => findCatalogPreviewFile(root, imageBaseName, "cop"));
+  const focus = findFirstExisting(focusCandidates)
+    ?? firstNonNull(roots, (root) => findCatalogPreviewFile(root, imageBaseName, "cof"));
   const thumbnail = findFirstExisting(thumbnails);
   return {
     id: variant.id,
@@ -732,6 +773,45 @@ async function capture(): Promise<CallToolResult> {
     end tell
   `, 60_000);
   return textResult(output);
+}
+
+// Debug/verification entry point: resolve (and optionally sips-convert) a
+// preview cache file for a given document + raw file path, without an MCP client
+// or a running Capture One. Validates catalog/session cache lookup directly.
+//   node dist/index.js --probe-cache "<docPath>" "<variantFile>" [--convert]
+if (process.argv.includes("--probe-cache")) {
+  const idx = process.argv.indexOf("--probe-cache");
+  const docPath = process.argv[idx + 1] ?? "";
+  const variantFile = process.argv[idx + 2] ?? "";
+  if (!docPath || !variantFile || variantFile.startsWith("--")) {
+    console.error('Usage: node dist/index.js --probe-cache "<docPath>" "<variantFile>" [--convert]');
+    process.exit(2);
+  }
+  const probeContext: CacheLookupContext = {
+    documentKind: "probe",
+    documentPath: docPath,
+    documentFolder: path.dirname(docPath),
+    variants: [{ id: "probe", name: path.basename(variantFile), file: variantFile }],
+  };
+  const info = findCacheForVariant(probeContext, probeContext.variants[0]) as Record<string, unknown>;
+  if (process.argv.includes("--convert")) {
+    const kind = (["proxy", "thumbnail", "focus"] as const).find((k) => info[k]);
+    if (kind) {
+      const chosen = info[kind] as { path: string };
+      const outputPath = path.join("/tmp", "capture-one-mcp-probe", `${path.basename(variantFile)}.${kind}.jpg`);
+      mkdirSync(path.dirname(outputPath), { recursive: true });
+      try {
+        await execFileAsync("sips", ["-s", "format", "jpeg", chosen.path, "--out", outputPath], { timeout: 30_000 });
+        info.converted = { kind, outputPath, ...safeStat(outputPath) };
+      } catch (error) {
+        info.converted = { kind, error: error instanceof Error ? error.message : String(error) };
+      }
+    } else {
+      info.converted = { error: "No cache preview found to convert." };
+    }
+  }
+  console.log(JSON.stringify(info, null, 2));
+  process.exit(0);
 }
 
 const server = new Server(
