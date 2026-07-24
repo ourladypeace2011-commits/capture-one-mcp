@@ -19,21 +19,30 @@ Read-only by default:
 - `capture_one_list_recipes` — process recipes as TSV
 - `capture_one_adjustment_fields` — list supported adjustment fields
 - `capture_one_get_selected_adjustments` — read tone/color adjustment values from selected variants
+- `capture_one_get_selected_curves` — read tone-curve points (rgb/luma/red/green/blue) as TSV
+- `capture_one_get_selected_layers` — list adjustment layers (index, name, kind, enabled, opacity, luma range) as TSV
 - `capture_one_find_selected_preview_cache` — locate internal Capture One preview/thumbnail cache files for selected variants
 - `capture_one_convert_selected_preview_cache` — convert internal preview cache to temporary JPEGs for vision analysis, without Capture One export
 
 Write/export tools are locked unless started with `CAPTURE_ONE_MCP_ALLOW_WRITE=1`:
 
 - `capture_one_set_selected_adjustments` — generic selected-variant adjustment writer
+- `capture_one_set_selected_curve` — replace the points of one tone curve
+- `capture_one_set_selected_layer` — set a layer's name/enabled/opacity/luma-range mask
+- `capture_one_set_selected_layer_adjustments` — set adjustment fields on one layer (local adjustments)
+- `capture_one_layer_mask` — run a mask command (clear/invert/fill/rasterize/feather/refine) on a layer
 - `capture_one_set_selected_rating`
 - `capture_one_process_selected`
 - `capture_one_capture`
 
 ## Adjustment coverage
 
-The server currently exposes 83 directly writable adjustment fields from Capture One's AppleScript dictionary, including white balance, exposure, contrast, saturation, color balance, levels, highlight/shadow recovery, clarity, dehaze amount, vignette, sharpening, noise reduction, film grain, and moire.
+The server exposes 83 directly writable scalar/text/boolean adjustment fields from Capture One's AppleScript dictionary (white balance, exposure, contrast, saturation, color balance, levels, highlight/shadow recovery, clarity, dehaze amount, vignette, sharpening, noise reduction, film grain, moire), plus dedicated tools for two nested-object families:
 
-Nested/special objects need dedicated helpers next: curves, color editor settings, and RGB color coercion. Those are controllable in principle, but should not be treated as a loose string API.
+- **Tone curves** — `rgb`/`luma`/`red`/`green`/`blue`, as ordered `{brightness (x, 0-100), amount (y, 0-100)}` points.
+- **Layers / masks / local adjustments** — enumerate/modify layers, apply the same adjustment fields per-layer, and run mask commands (feather/refine take an amount).
+
+The **Color Editor** is not exposed: the sdef `color editor options` class declares no scriptable properties or elements, so it is not addressable via AppleScript in this Capture One version. RGB-color object fields (e.g. dehaze color) also still need coercion helpers. Catalog thumbnail (`.cot`) lookup by numeric id is deferred — the high-res `.cop` proxy is already resolved by filename and is the better vision source anyway.
 
 ## Preview cache notes
 

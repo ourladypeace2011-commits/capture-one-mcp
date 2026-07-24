@@ -132,6 +132,37 @@ const DEFAULT_STYLE_FIELDS = [
 
 const ADJUSTMENT_FIELD_BY_NAME: Map<string, { name: string; type: string }> = new Map(ADJUSTMENT_FIELDS.map((field) => [field.name, field]));
 
+// Tone curves: sdef `curve` class holds `curve point` elements (brightness = x 0-100,
+// amount = y 0-100). Five curve properties live on `adjustment settings`.
+const CURVE_PROPERTY_BY_NAME: Record<string, string> = {
+  rgb: "rgb curve",
+  luma: "luma curve",
+  red: "red curve",
+  green: "green curve",
+  blue: "blue curve",
+};
+
+// Layer mask commands (sdef): all take a `layer` direct-parameter; feather/refine take amount.
+const LAYER_MASK_COMMANDS: Record<string, { command: string; takesAmount: boolean; min: number; max: number }> = {
+  clear: { command: "clear mask", takesAmount: false, min: 0, max: 0 },
+  invert: { command: "invert mask", takesAmount: false, min: 0, max: 0 },
+  fill: { command: "fill mask", takesAmount: false, min: 0, max: 0 },
+  rasterize: { command: "rasterize mask", takesAmount: false, min: 0, max: 0 },
+  feather: { command: "feather mask", takesAmount: true, min: 0, max: 100 },
+  refine: { command: "refine mask", takesAmount: true, min: 0, max: 300 },
+};
+
+// `luma range settings` fields (the layer mask's luma-range) and their AppleScript types.
+const LUMA_RANGE_FIELD_TYPES: Record<string, "real" | "boolean"> = {
+  "range low": "real",
+  "range high": "real",
+  "falloff low": "real",
+  "falloff high": "real",
+  "invert": "boolean",
+  "radius": "real",
+  "sensitivity": "real",
+};
+
 
 const tools: Tool[] = [
   {
@@ -225,6 +256,89 @@ const tools: Tool[] = [
     name: "capture_one_capture",
     description: "Trigger tethered capture with the currently selected camera into the foreground document. Mutating; requires CAPTURE_ONE_MCP_ALLOW_WRITE=1.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "capture_one_get_selected_curves",
+    description: "Read tone-curve points (rgb, luma, red, green, blue) of selected variants' base adjustments as TSV. Each point has brightness (x, 0-100) and amount (y, 0-100). Requires Capture One running.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "capture_one_set_selected_curve",
+    description: "Replace the points of one tone curve on all selected variants' base adjustments. Points replace ALL existing points, so include endpoints. Mutating; requires CAPTURE_ONE_MCP_ALLOW_WRITE=1.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        curve: { type: "string", enum: ["rgb", "luma", "red", "green", "blue"], description: "Which curve to set." },
+        points: {
+          type: "array",
+          description: "Ordered curve points; each { brightness: 0-100 (x, shadow→highlight), amount: 0-100 (y) }.",
+          items: {
+            type: "object",
+            properties: { brightness: { type: "number" }, amount: { type: "number" } },
+            required: ["brightness", "amount"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["curve", "points"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "capture_one_get_selected_layers",
+    description: "List adjustment layers of selected variants as TSV: variant id, 1-based layer index, name, kind (background/adjustment/clone/heal), enabled, opacity, and luma-range low/high. Requires Capture One running.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "capture_one_set_selected_layer",
+    description: "Set properties of one layer (by 1-based index) on all selected variants: name, enabled, opacity, and/or luma-range mask settings. Mutating; requires CAPTURE_ONE_MCP_ALLOW_WRITE=1.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        layerIndex: { type: "integer", minimum: 1, description: "1-based layer index (see capture_one_get_selected_layers)." },
+        name: { type: "string" },
+        enabled: { type: "boolean" },
+        opacity: { type: "integer", minimum: 1, maximum: 100 },
+        lumaRange: {
+          type: "object",
+          description: "Luma-range mask settings; subset of 'range low'/'range high'/'falloff low'/'falloff high'/'radius'/'sensitivity' (reals) and 'invert' (boolean).",
+          additionalProperties: { anyOf: [{ type: "number" }, { type: "boolean" }] },
+        },
+      },
+      required: ["layerIndex"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "capture_one_set_selected_layer_adjustments",
+    description: "Set adjustment fields (same names as capture_one_adjustment_fields) on one layer (by 1-based index) of all selected variants — local adjustments. Mutating; requires CAPTURE_ONE_MCP_ALLOW_WRITE=1.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        layerIndex: { type: "integer", minimum: 1 },
+        settings: {
+          type: "object",
+          description: "Map of Capture One adjustment field name to value, e.g. {\"exposure\": 0.2}.",
+          additionalProperties: { anyOf: [{ type: "number" }, { type: "boolean" }, { type: "string" }] },
+        },
+      },
+      required: ["layerIndex", "settings"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "capture_one_layer_mask",
+    description: "Run a mask command on one layer (by 1-based index) of all selected variants: clear, invert, fill, rasterize, feather (amount 0-100), or refine (amount 0-300). Mutating; requires CAPTURE_ONE_MCP_ALLOW_WRITE=1.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        layerIndex: { type: "integer", minimum: 1 },
+        command: { type: "string", enum: ["clear", "invert", "fill", "rasterize", "feather", "refine"] },
+        amount: { type: "number", description: "Required for feather (0-100) and refine (0-300); ignored otherwise." },
+      },
+      required: ["layerIndex", "command"],
+      additionalProperties: false,
+    },
   },
 ];
 
@@ -599,10 +713,13 @@ async function adjustmentFields(): Promise<CallToolResult> {
     count: ADJUSTMENT_FIELDS.length,
     fields: ADJUSTMENT_FIELDS,
     defaultStyleFields: DEFAULT_STYLE_FIELDS,
-    intentionallyExcludedForNow: [
-      "curves require point-level helpers",
-      "color editor settings requires nested object mapping",
-      "dehaze color/RGB color requires RGB coercion helper",
+    nestedObjectTools: [
+      "curves: use capture_one_get_selected_curves / capture_one_set_selected_curve (rgb/luma/red/green/blue)",
+      "layers/masks/local adjustments: use capture_one_get_selected_layers / capture_one_set_selected_layer / capture_one_set_selected_layer_adjustments / capture_one_layer_mask",
+    ],
+    notScriptable: [
+      "color editor settings: the sdef `color editor options` class exposes no properties/elements, so the Color Editor is not addressable via AppleScript in this version",
+      "dehaze color / RGB color object fields require RGB coercion not yet implemented",
     ],
   });
 }
@@ -814,6 +931,209 @@ if (process.argv.includes("--probe-cache")) {
   process.exit(0);
 }
 
+async function getSelectedCurves(): Promise<CallToolResult> {
+  const running = await isRunning();
+  if (!running) return errorResult("Capture One is not running. Open it before calling this tool.");
+  const curveReads = Object.entries(CURVE_PROPERTY_BY_NAME).map(([key, prop]) => `
+        repeat with cp in (every curve point of ${prop} of adjustments of v)
+          set end of rows to variantId & tab & ${appleString(key)} & tab & (brightness of cp as text) & tab & (amount of cp as text)
+        end repeat`).join("\n");
+  const tsv = await runAppleScript(`
+    tell application ${appleString(PROCESS_NAME)}
+      set rows to {"variant_id" & tab & "curve" & tab & "brightness" & tab & "amount"}
+      tell current document to set selectedList to every variant whose selected is true
+      repeat with v in selectedList
+        set variantId to ""
+        try
+          set variantId to id of v as text
+        end try
+${curveReads}
+      end repeat
+      set AppleScript's text item delimiters to linefeed
+      return rows as text
+    end tell
+  `);
+  return textResult(tsv);
+}
+
+async function setSelectedCurve(args: JsonObject): Promise<CallToolResult> {
+  assertWriteAllowed();
+  const curveKey = typeof args.curve === "string" ? args.curve : "";
+  const prop = CURVE_PROPERTY_BY_NAME[curveKey];
+  if (!prop) return errorResult("curve must be one of rgb, luma, red, green, blue.");
+  const points = Array.isArray(args.points) ? args.points : null;
+  if (!points || points.length === 0) return errorResult("points must be a non-empty array of { brightness, amount }.");
+  const makeLines = points.map((p) => {
+    const pt = p as JsonObject;
+    const b = Number(pt.brightness);
+    const a = Number(pt.amount);
+    if (!Number.isFinite(b) || !Number.isFinite(a)) throw new Error("Each point needs finite brightness and amount.");
+    return `        make new curve point at end of theCurve with properties {brightness:${b}, amount:${a}}`;
+  }).join("\n");
+  const output = await runAppleScript(`
+    tell application ${appleString(PROCESS_NAME)}
+      tell current document to set selectedList to every variant whose selected is true
+      if (count of selectedList) is 0 then error "No selected variants."
+      set updatedCount to 0
+      repeat with v in selectedList
+        set theCurve to ${prop} of adjustments of v
+        delete every curve point of theCurve
+${makeLines}
+        set updatedCount to updatedCount + 1
+      end repeat
+      return "set ${curveKey} curve (${points.length} point(s)) on " & (updatedCount as text) & " variant(s)"
+    end tell
+  `);
+  return textResult(output);
+}
+
+async function getSelectedLayers(): Promise<CallToolResult> {
+  const running = await isRunning();
+  if (!running) return errorResult("Capture One is not running. Open it before calling this tool.");
+  const tsv = await runAppleScript(`
+    tell application ${appleString(PROCESS_NAME)}
+      set rows to {"variant_id" & tab & "layer_index" & tab & "name" & tab & "kind" & tab & "enabled" & tab & "opacity" & tab & "luma_range_low" & tab & "luma_range_high"}
+      tell current document to set selectedList to every variant whose selected is true
+      repeat with v in selectedList
+        set variantId to ""
+        try
+          set variantId to id of v as text
+        end try
+        set layerIndex to 0
+        repeat with lyr in (every layer of v)
+          set layerIndex to layerIndex + 1
+          set lName to ""
+          set lKind to ""
+          set lEnabled to ""
+          set lOpacity to ""
+          set lLow to ""
+          set lHigh to ""
+          try
+            set lName to name of lyr as text
+          end try
+          try
+            set lKind to kind of lyr as text
+          end try
+          try
+            set lEnabled to enabled of lyr as text
+          end try
+          try
+            set lOpacity to opacity of lyr as text
+          end try
+          try
+            set lLow to range low of luma range of lyr as text
+          end try
+          try
+            set lHigh to range high of luma range of lyr as text
+          end try
+          set end of rows to variantId & tab & (layerIndex as text) & tab & lName & tab & lKind & tab & lEnabled & tab & lOpacity & tab & lLow & tab & lHigh
+        end repeat
+      end repeat
+      set AppleScript's text item delimiters to linefeed
+      return rows as text
+    end tell
+  `);
+  return textResult(tsv);
+}
+
+async function setSelectedLayer(args: JsonObject): Promise<CallToolResult> {
+  assertWriteAllowed();
+  const layerIndex = Number(args.layerIndex);
+  if (!Number.isInteger(layerIndex) || layerIndex < 1) return errorResult("layerIndex must be a positive integer (1-based).");
+  const setLines: string[] = [];
+  if (typeof args.name === "string") setLines.push(`        set name of lyr to ${appleString(args.name)}`);
+  if (typeof args.enabled === "boolean") setLines.push(`        set enabled of lyr to ${args.enabled ? "true" : "false"}`);
+  if (args.opacity !== undefined) {
+    const op = Number(args.opacity);
+    if (!Number.isInteger(op) || op < 1 || op > 100) return errorResult("opacity must be an integer 1-100.");
+    setLines.push(`        set opacity of lyr to ${op}`);
+  }
+  if (args.lumaRange && typeof args.lumaRange === "object" && !Array.isArray(args.lumaRange)) {
+    for (const [field, value] of Object.entries(args.lumaRange as JsonObject)) {
+      const fieldType = LUMA_RANGE_FIELD_TYPES[field];
+      if (!fieldType) return errorResult(`Unsupported luma range field: ${field}`);
+      setLines.push(`        set ${field} of luma range of lyr to ${appleLiteral(value, fieldType)}`);
+    }
+  }
+  if (setLines.length === 0) return errorResult("Provide at least one of name, enabled, opacity, lumaRange.");
+  const output = await runAppleScript(`
+    tell application ${appleString(PROCESS_NAME)}
+      tell current document to set selectedList to every variant whose selected is true
+      if (count of selectedList) is 0 then error "No selected variants."
+      set updatedCount to 0
+      repeat with v in selectedList
+        if (count of layers of v) < ${layerIndex} then error "Layer index ${layerIndex} out of range for a selected variant."
+        set lyr to layer ${layerIndex} of v
+${setLines.join("\n")}
+        set updatedCount to updatedCount + 1
+      end repeat
+      return "updated layer ${layerIndex} on " & (updatedCount as text) & " variant(s)"
+    end tell
+  `);
+  return textResult(output);
+}
+
+async function setSelectedLayerAdjustments(args: JsonObject): Promise<CallToolResult> {
+  assertWriteAllowed();
+  const layerIndex = Number(args.layerIndex);
+  if (!Number.isInteger(layerIndex) || layerIndex < 1) return errorResult("layerIndex must be a positive integer (1-based).");
+  const settings = args.settings;
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return errorResult("settings must be an object.");
+  const entries = Object.entries(settings as JsonObject);
+  if (entries.length === 0) return errorResult("settings must include at least one adjustment field.");
+  const setLines = entries.map(([field, value]) => {
+    const spec = ADJUSTMENT_FIELD_BY_NAME.get(field);
+    if (!spec) throw new Error(`Unsupported Capture One adjustment field: ${field}`);
+    return `        set ${field} of adjustments of lyr to ${appleLiteral(value, spec.type)}`;
+  }).join("\n");
+  const output = await runAppleScript(`
+    tell application ${appleString(PROCESS_NAME)}
+      tell current document to set selectedList to every variant whose selected is true
+      if (count of selectedList) is 0 then error "No selected variants."
+      set updatedCount to 0
+      repeat with v in selectedList
+        if (count of layers of v) < ${layerIndex} then error "Layer index ${layerIndex} out of range for a selected variant."
+        set lyr to layer ${layerIndex} of v
+${setLines}
+        set updatedCount to updatedCount + 1
+      end repeat
+      return "updated layer ${layerIndex} adjustments (${entries.map(([field]) => field).join(", ")}) on " & (updatedCount as text) & " variant(s)"
+    end tell
+  `);
+  return textResult(output);
+}
+
+async function layerMask(args: JsonObject): Promise<CallToolResult> {
+  assertWriteAllowed();
+  const layerIndex = Number(args.layerIndex);
+  if (!Number.isInteger(layerIndex) || layerIndex < 1) return errorResult("layerIndex must be a positive integer (1-based).");
+  const cmdKey = typeof args.command === "string" ? args.command : "";
+  const spec = LAYER_MASK_COMMANDS[cmdKey];
+  if (!spec) return errorResult("command must be one of clear, invert, fill, rasterize, feather, refine.");
+  let cmdLine = `${spec.command} (layer ${layerIndex} of v)`;
+  if (spec.takesAmount) {
+    const amount = Number(args.amount);
+    if (!Number.isFinite(amount) || amount < spec.min || amount > spec.max) {
+      return errorResult(`${cmdKey} requires amount between ${spec.min} and ${spec.max}.`);
+    }
+    cmdLine = `${spec.command} (layer ${layerIndex} of v) amount ${amount}`;
+  }
+  const output = await runAppleScript(`
+    tell application ${appleString(PROCESS_NAME)}
+      tell current document to set selectedList to every variant whose selected is true
+      if (count of selectedList) is 0 then error "No selected variants."
+      set updatedCount to 0
+      repeat with v in selectedList
+        if (count of layers of v) < ${layerIndex} then error "Layer index ${layerIndex} out of range for a selected variant."
+        ${cmdLine}
+        set updatedCount to updatedCount + 1
+      end repeat
+      return "${spec.command} on layer ${layerIndex} of " & (updatedCount as text) & " variant(s)"
+    end tell
+  `);
+  return textResult(output);
+}
+
 const server = new Server(
   { name: "capture-one-mcp", version: "0.1.0" },
   { capabilities: { tools: {} } },
@@ -836,6 +1156,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "capture_one_set_selected_rating": return await setSelectedRating(args);
       case "capture_one_process_selected": return await processSelected(args);
       case "capture_one_capture": return await capture();
+      case "capture_one_get_selected_curves": return await getSelectedCurves();
+      case "capture_one_set_selected_curve": return await setSelectedCurve(args);
+      case "capture_one_get_selected_layers": return await getSelectedLayers();
+      case "capture_one_set_selected_layer": return await setSelectedLayer(args);
+      case "capture_one_set_selected_layer_adjustments": return await setSelectedLayerAdjustments(args);
+      case "capture_one_layer_mask": return await layerMask(args);
       default: return errorResult(`Unknown tool: ${request.params.name}`);
     }
   } catch (error) {
