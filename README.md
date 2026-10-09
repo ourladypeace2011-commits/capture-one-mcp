@@ -35,6 +35,13 @@ Write/export tools are locked unless started with `CAPTURE_ONE_MCP_ALLOW_WRITE=1
 - `capture_one_process_selected`
 - `capture_one_capture`
 
+**Multi-variant writes are not transactional** — Capture One applies each AppleScript write immediately and has no scriptable undo. The write tools therefore:
+
+- validate everything that can be checked up front before the first write (argument ranges; curve points must be 0-100 with strictly increasing brightness; layer tools check that *every* selected variant has the requested layer) — a failure there changes nothing;
+- if a write still fails mid-way, return `isError` with `updated` (already changed, keep new values), `failedVariant`, `notAttempted`, and the cause;
+- for `set_selected_curve`, capture the old points before clearing and restore them on the variant that failed (reported as `recovery`);
+- on an osascript timeout, warn that some variants may already be modified (re-read state before retrying).
+
 ## Adjustment coverage
 
 The server exposes 83 directly writable scalar/text/boolean adjustment fields from Capture One's AppleScript dictionary (white balance, exposure, contrast, saturation, color balance, levels, highlight/shadow recovery, clarity, dehaze amount, vignette, sharpening, noise reduction, film grain, moire), plus dedicated tools for two nested-object families:
