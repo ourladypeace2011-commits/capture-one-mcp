@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { perVariantWriteScript, runWrite, setCurveTool, layerPrecheck } from "./writeOps.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -585,6 +586,9 @@ async function runAppleScript(script: string, timeoutMs = DEFAULT_TIMEOUT_MS): P
   });
 }
 
+// Write tools: same runner, bound for injection into writeOps.
+const runWriteScript = (script: string) => runAppleScript(script);
+
 async function appBundleVersion(): Promise<string | null> {
   if (!existsSync(APP_PATH)) return null;
   try {
@@ -829,19 +833,11 @@ async function setSelectedAdjustments(args: JsonObject): Promise<CallToolResult>
     return `        set ${field} of adjustments of v to ${appleLiteral(value, spec.type)}`;
   }).join("\n");
 
-  const output = await runAppleScript(`
-    tell application ${appleString(PROCESS_NAME)}
-      tell current document to set selectedList to every variant whose selected is true
-      if (count of selectedList) is 0 then error "No selected variants."
-      set updatedCount to 0
-      repeat with v in selectedList
-${setLines}
-        set updatedCount to updatedCount + 1
-      end repeat
-      return "updated " & (updatedCount as text) & " selected variant(s); fields: ${entries.map(([field]) => field).join(", ")}"
-    end tell
-  `);
-  return textResult(output);
+  return await runWrite(
+    `set adjustments (${entries.map(([field]) => field).join(", ")})`,
+    perVariantWriteScript({ appName: PROCESS_NAME, body: setLines }),
+    runWriteScript,
+  );
 }
 
 async function setSelectedRating(args: JsonObject): Promise<CallToolResult> {
@@ -849,18 +845,11 @@ async function setSelectedRating(args: JsonObject): Promise<CallToolResult> {
   const rating = Number(args.rating);
   if (!Number.isInteger(rating) || rating < 0 || rating > 5) return errorResult("rating must be an integer from 0 to 5.");
 
-  const output = await runAppleScript(`
-    tell application ${appleString(PROCESS_NAME)}
-      set updatedCount to 0
-      tell current document to set selectedList to every variant whose selected is true
-      repeat with v in selectedList
-        set rating of v to ${rating}
-        set updatedCount to updatedCount + 1
-      end repeat
-      return "updated " & (updatedCount as text) & " selected variant(s) to rating ${rating}"
-    end tell
-  `);
-  return textResult(output);
+  return await runWrite(
+    `set rating ${rating}`,
+    perVariantWriteScript({ appName: PROCESS_NAME, body: `set rating of v to ${rating}` }),
+    runWriteScript,
+  );
 }
 
 async function processSelected(args: JsonObject): Promise<CallToolResult> {
@@ -959,32 +948,9 @@ ${curveReads}
 async function setSelectedCurve(args: JsonObject): Promise<CallToolResult> {
   assertWriteAllowed();
   const curveKey = typeof args.curve === "string" ? args.curve : "";
-  const prop = CURVE_PROPERTY_BY_NAME[curveKey];
-  if (!prop) return errorResult("curve must be one of rgb, luma, red, green, blue.");
-  const points = Array.isArray(args.points) ? args.points : null;
-  if (!points || points.length === 0) return errorResult("points must be a non-empty array of { brightness, amount }.");
-  const makeLines = points.map((p) => {
-    const pt = p as JsonObject;
-    const b = Number(pt.brightness);
-    const a = Number(pt.amount);
-    if (!Number.isFinite(b) || !Number.isFinite(a)) throw new Error("Each point needs finite brightness and amount.");
-    return `        make new curve point at end of theCurve with properties {brightness:${b}, amount:${a}}`;
-  }).join("\n");
-  const output = await runAppleScript(`
-    tell application ${appleString(PROCESS_NAME)}
-      tell current document to set selectedList to every variant whose selected is true
-      if (count of selectedList) is 0 then error "No selected variants."
-      set updatedCount to 0
-      repeat with v in selectedList
-        set theCurve to ${prop} of adjustments of v
-        delete every curve point of theCurve
-${makeLines}
-        set updatedCount to updatedCount + 1
-      end repeat
-      return "set ${curveKey} curve (${points.length} point(s)) on " & (updatedCount as text) & " variant(s)"
-    end tell
-  `);
-  return textResult(output);
+  // All points are validated (0-100, strictly increasing brightness) before anything is deleted;
+  // on a mid-write failure the failed variant's previous curve is restored and reported.
+  return await setCurveTool(args, CURVE_PROPERTY_BY_NAME[curveKey], PROCESS_NAME, runWriteScript);
 }
 
 async function getSelectedLayers(): Promise<CallToolResult> {
@@ -1056,21 +1022,15 @@ async function setSelectedLayer(args: JsonObject): Promise<CallToolResult> {
     }
   }
   if (setLines.length === 0) return errorResult("Provide at least one of name, enabled, opacity, lumaRange.");
-  const output = await runAppleScript(`
-    tell application ${appleString(PROCESS_NAME)}
-      tell current document to set selectedList to every variant whose selected is true
-      if (count of selectedList) is 0 then error "No selected variants."
-      set updatedCount to 0
-      repeat with v in selectedList
-        if (count of layers of v) < ${layerIndex} then error "Layer index ${layerIndex} out of range for a selected variant."
-        set lyr to layer ${layerIndex} of v
-${setLines.join("\n")}
-        set updatedCount to updatedCount + 1
-      end repeat
-      return "updated layer ${layerIndex} on " & (updatedCount as text) & " variant(s)"
-    end tell
-  `);
-  return textResult(output);
+  return await runWrite(
+    `update layer ${layerIndex}`,
+    perVariantWriteScript({
+      appName: PROCESS_NAME,
+      precheck: layerPrecheck(layerIndex),
+      body: [`set lyr to layer ${layerIndex} of v`, ...setLines].join("\n"),
+    }),
+    runWriteScript,
+  );
 }
 
 async function setSelectedLayerAdjustments(args: JsonObject): Promise<CallToolResult> {
@@ -1086,21 +1046,15 @@ async function setSelectedLayerAdjustments(args: JsonObject): Promise<CallToolRe
     if (!spec) throw new Error(`Unsupported Capture One adjustment field: ${field}`);
     return `        set ${field} of adjustments of lyr to ${appleLiteral(value, spec.type)}`;
   }).join("\n");
-  const output = await runAppleScript(`
-    tell application ${appleString(PROCESS_NAME)}
-      tell current document to set selectedList to every variant whose selected is true
-      if (count of selectedList) is 0 then error "No selected variants."
-      set updatedCount to 0
-      repeat with v in selectedList
-        if (count of layers of v) < ${layerIndex} then error "Layer index ${layerIndex} out of range for a selected variant."
-        set lyr to layer ${layerIndex} of v
-${setLines}
-        set updatedCount to updatedCount + 1
-      end repeat
-      return "updated layer ${layerIndex} adjustments (${entries.map(([field]) => field).join(", ")}) on " & (updatedCount as text) & " variant(s)"
-    end tell
-  `);
-  return textResult(output);
+  return await runWrite(
+    `update layer ${layerIndex} adjustments (${entries.map(([field]) => field).join(", ")})`,
+    perVariantWriteScript({
+      appName: PROCESS_NAME,
+      precheck: layerPrecheck(layerIndex),
+      body: `set lyr to layer ${layerIndex} of v\n${setLines}`,
+    }),
+    runWriteScript,
+  );
 }
 
 async function layerMask(args: JsonObject): Promise<CallToolResult> {
@@ -1118,20 +1072,11 @@ async function layerMask(args: JsonObject): Promise<CallToolResult> {
     }
     cmdLine = `${spec.command} (layer ${layerIndex} of v) amount ${amount}`;
   }
-  const output = await runAppleScript(`
-    tell application ${appleString(PROCESS_NAME)}
-      tell current document to set selectedList to every variant whose selected is true
-      if (count of selectedList) is 0 then error "No selected variants."
-      set updatedCount to 0
-      repeat with v in selectedList
-        if (count of layers of v) < ${layerIndex} then error "Layer index ${layerIndex} out of range for a selected variant."
-        ${cmdLine}
-        set updatedCount to updatedCount + 1
-      end repeat
-      return "${spec.command} on layer ${layerIndex} of " & (updatedCount as text) & " variant(s)"
-    end tell
-  `);
-  return textResult(output);
+  return await runWrite(
+    `${spec.command} on layer ${layerIndex}`,
+    perVariantWriteScript({ appName: PROCESS_NAME, precheck: layerPrecheck(layerIndex), body: cmdLine }),
+    runWriteScript,
+  );
 }
 
 const server = new Server(
