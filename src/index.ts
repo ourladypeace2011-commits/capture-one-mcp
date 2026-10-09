@@ -404,14 +404,6 @@ function findFirstExisting(paths: string[]): string | null {
   return null;
 }
 
-function firstNonNull<T, R>(items: T[], fn: (item: T) => R | null): R | null {
-  for (const item of items) {
-    const result = fn(item);
-    if (result) return result;
-  }
-  return null;
-}
-
 function listThumbnailCandidates(cacheRoot: string, imageBaseName: string): string[] {
   const thumbDir = path.join(cacheRoot, "Thumbnails");
   try {
@@ -429,29 +421,36 @@ function listThumbnailCandidates(cacheRoot: string, imageBaseName: string): stri
 // <imageBaseName>.<ext>. Catalog thumbnails are named by numeric catalog id, not
 // the raw basename, so catalog thumbnail lookup still needs the catalog DB and is
 // intentionally left to the session-style Thumbnails path above.
-function walkForFile(dir: string, targetName: string, maxDepth: number): string | null {
-  if (maxDepth < 0) return null;
+// Collects EVERY match: the name is only the raw basename, so two raws called
+// DSC00001.ARW (camera counter wrap, two bodies) share it. Returning the first hit
+// handed back another photo's preview as if it were this one's.
+function walkForFiles(dir: string, targetName: string, maxDepth: number, found: string[]): string[] {
+  if (maxDepth < 0) return found;
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
-    return null;
+    return found;
   }
   for (const entry of entries) {
-    if (entry.isFile() && entry.name === targetName) return path.join(dir, entry.name);
+    if (entry.isFile() && entry.name === targetName) found.push(path.join(dir, entry.name));
   }
   for (const entry of entries) {
-    if (entry.isDirectory()) {
-      const found = walkForFile(path.join(dir, entry.name), targetName, maxDepth - 1);
-      if (found) return found;
-    }
+    if (entry.isDirectory()) walkForFiles(path.join(dir, entry.name), targetName, maxDepth - 1, found);
   }
-  return null;
+  return found;
 }
 
-function findCatalogPreviewFile(cacheRoot: string, imageBaseName: string, ext: string): string | null {
+function findCatalogPreviewFiles(cacheRoot: string, imageBaseName: string, ext: string): string[] {
   // Previews date tree is Previews/YYYY/MM/DD/HH → 4 levels; cap at 6 for headroom.
-  return walkForFile(path.join(cacheRoot, "Previews"), `${imageBaseName}.${ext}`, 6);
+  return walkForFiles(path.join(cacheRoot, "Previews"), `${imageBaseName}.${ext}`, 6, []);
+}
+
+// Exactly one catalog match → use it. Several → refuse to guess (null) and report
+// the candidates, so a caller never analyses the wrong photo believing it is this one.
+function uniqueCatalogPreview(roots: string[], imageBaseName: string, ext: string): { path: string | null; candidates: string[] } {
+  const candidates = uniqueStrings(roots.flatMap((root) => findCatalogPreviewFiles(root, imageBaseName, ext)));
+  return { path: candidates.length === 1 ? candidates[0] : null, candidates };
 }
 
 function uniqueStrings(values: Array<string | null | undefined>): string[] {
@@ -542,10 +541,14 @@ function findCacheForVariant(context: CacheLookupContext, variant: SelectedVaria
   const proxyCandidates = roots.map((root) => path.join(root, "Proxies", `${imageBaseName}.cop`));
   const focusCandidates = roots.map((root) => path.join(root, "Proxies", `${imageBaseName}.cof`));
   const thumbnails = roots.flatMap((root) => listThumbnailCandidates(root, imageBaseName));
-  const proxy = findFirstExisting(proxyCandidates)
-    ?? firstNonNull(roots, (root) => findCatalogPreviewFile(root, imageBaseName, "cop"));
-  const focus = findFirstExisting(focusCandidates)
-    ?? firstNonNull(roots, (root) => findCatalogPreviewFile(root, imageBaseName, "cof"));
+  const ambiguous: Record<string, string[]> = {};
+  const fromCatalog = (ext: string, kind: string): string | null => {
+    const hit = uniqueCatalogPreview(roots, imageBaseName, ext);
+    if (hit.candidates.length > 1) ambiguous[kind] = hit.candidates;
+    return hit.path;
+  };
+  const proxy = findFirstExisting(proxyCandidates) ?? fromCatalog("cop", "proxy");
+  const focus = findFirstExisting(focusCandidates) ?? fromCatalog("cof", "focus");
   const thumbnail = findFirstExisting(thumbnails);
   return {
     id: variant.id,
@@ -553,6 +556,9 @@ function findCacheForVariant(context: CacheLookupContext, variant: SelectedVaria
     file: variant.file,
     imageBaseName,
     cacheRootsTried: roots,
+    ...(Object.keys(ambiguous).length
+      ? { ambiguous, ambiguousNote: "Several catalog previews share this raw filename; none was picked. Export the variant instead." }
+      : {}),
     proxy: proxy ? { path: proxy, ...safeStat(proxy), kind: "proxy", format: "JPEG XL container (.cop)" } : null,
     focus: focus ? { path: focus, ...safeStat(focus), kind: "focus", format: "JPEG grayscale (.cof)" } : null,
     thumbnail: thumbnail ? { path: thumbnail, ...safeStat(thumbnail), kind: "thumbnail", format: "JPEG (.cot)" } : null,
@@ -785,7 +791,16 @@ async function convertSelectedPreviewCache(args: JsonObject): Promise<CallToolRe
         : ["focus", "proxy", "thumbnail"];
     const chosenKind = orderedKinds.find((kind) => cache[kind]);
     if (!chosenKind) {
-      converted.push({ id: variant.id, name: variant.name, file: variant.file, error: "No Capture One cache preview found." });
+      const ambiguous = cache.ambiguous as Record<string, string[]> | undefined;
+      converted.push({
+        id: variant.id,
+        name: variant.name,
+        file: variant.file,
+        error: ambiguous
+          ? "Ambiguous: several catalog previews share this raw filename, refusing to guess which photo it is."
+          : "No Capture One cache preview found.",
+        ...(ambiguous ? { ambiguous } : {}),
+      });
       continue;
     }
     const chosen = cache[chosenKind] as { path: string };
